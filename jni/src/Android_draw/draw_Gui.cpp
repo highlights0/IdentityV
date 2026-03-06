@@ -2,10 +2,25 @@
 #include <thread>
 #include <cstdint>
 #include <stdio.h>
-#include <sched.h>
-#include <climits>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <iomanip>
+#include <atomic>
+#include <math.h>
 #include <unistd.h>
-#include <sys/syscall.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <cmath> 
+#include <linux/input.h>
+
+// ================== 图片加载支持 ==================
+#include <GLES2/gl2.h>
+#define STB_IMAGE_IMPLEMENTATION 
+#include "stb_image.h"
+// ================================================
+
+// 项目头文件
 #include "My_font/zh_Font.h"
 #include "My_font/fontawesome-brands.h"
 #include "My_font/fontawesome-regular.h"
@@ -15,344 +30,172 @@
 #include "DrawTool.h"
 #include "Name.h"
 #include "Offsets.h"
-#include <sstream>
-#include <iomanip>
-#include <atomic>
 
-// ============== 获取内存占用 ==============
-static size_t get_memory_usage_kb() {
-    FILE* file = fopen("/proc/self/statm", "r");
-    if (!file) return 0;
-    
-    size_t size = 0;  // 总虚拟内存页数
-    size_t resident = 0;  // 驻留内存页数 (实际物理内存)
-    fscanf(file, "%zu %zu", &size, &resident);
-    fclose(file);
-    
-    // 页大小通常是4KB
-    return resident * 4;  // 返回KB
-}
-
-// ============== 优化：过滤关键词表 ==============
-static const char* g_filter_keywords[] = {
-    "creature",
-    "dm65_survivor_girl_page",
-    "skill_hudie",
-    "h55_joseph_camera",
-    "burke_console",
-    "redqueen_e_heijin_yizi",
-    "qiutu_box",
-    "weapon",
-    "nvyao"
+// ============== 结构体定义 ==============
+struct Vector3A {
+    float X, Y, Z;
+    Vector3A(float x = 0, float y = 0, float z = 0) : X(x), Y(y), Z(z) {}
 };
-static constexpr int g_filter_count = sizeof(g_filter_keywords) / sizeof(g_filter_keywords[0]);
 
-// 快速检查是否需要过滤（包含任意关键词则返回true）
-inline bool should_filter(const std::string& name) {
-    for (int i = 0; i < g_filter_count; i++) {
-        if (name.find(g_filter_keywords[i]) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// 快速检查是否包含指定字符串
-inline bool contains(const std::string& str, const char* pattern) {
-    return str.find(pattern) != std::string::npos;
-}
-
-std::string 过滤类名,类名;
-char gwd1[64];
-char gwd2[64];
-float 距离比例=11.886;
-float 红夫人X, 红夫人Y, 红夫人Z;
-float 红夫人镜像X, 红夫人镜像Y, 红夫人镜像Z;
-typedef struct DataStruct{
+struct DataStruct {
     long int obj = 0;
-    char str[256] = {0}; // 初始化为全零
-    int 阵营 = 1;
-    char 类名[256] = {0};
+    char str[256] = { 0 };
+    int 阵营 = 0; // 1:监管, 2:求生, 3:场景, 4:道具
+    char 类名[256] = { 0 };
     long int objcoor = 0;
-}DataStruct;
+};
 
-// 三缓冲结构 - 完全无锁方案
 struct GameDataBuffer {
     DataStruct data[2000];
     int 数量 = 0;
 };
-GameDataBuffer g_buffer[3];                    // 三缓冲区
-std::atomic<int> g_read_index{0};              // 当前读取的缓冲区索引
-std::atomic<int> g_write_index{1};             // 当前写入的缓冲区索引
+
+struct MapConfig {
+    float minX, maxX, minY, maxY;
+    bool isVerticalMap;
+    const char* name;
+    int gridX, gridY;
+};
+
+// ============== 前置声明 ==============
+void Draw_UnifiedMap(ImDrawList* Draw, const MapConfig& cfg);
+void Draw_Main(ImDrawList* Draw);
+void DrawCenteredText(ImDrawList* Draw, const ImVec2& pos, const ImColor& color, const char* text);
+bool GetEntityPosition(const DataStruct& obj, Vector3A& pos);
+bool ShouldSkipEntity(const DataStruct& obj, const Vector3A& pos);
+void LoadMapTexture(int index);
+
+// ============== 常量与全局配置 ==============
+const ImColor COL_RED(250, 0, 0, 255);
+const ImColor COL_GREEN(0, 255, 0, 255);
+const ImColor COL_BLUE(0, 0, 255, 255);
+const ImColor COL_YELLOW(255, 255, 0, 255);
+const ImColor COL_PURPLE(255, 0, 255, 255);
+const ImColor COL_BLACK(0, 0, 0, 255);
+const ImColor COL_LIGHT_BLUE(0, 191, 255, 255);
+const ImColor COL_WHITE(255, 255, 255, 255);
+const ImColor COL_ORANGE(255, 165, 0, 255);
+
+// ================== 强化后的过滤逻辑 ==================
+static const std::vector<std::string> g_filter_keywords = {
+    "creature", "girl_page", "skill_hudie", "joseph_camera",
+    "burke_console", "heijin_yizi", "qiutu_box", "weapon",
+    "nvyao", "detective", "dress_ghost", "part", "effect",
+    "sound", "_lod", "_shadow", "_ui_", "_indicator",
+    "collision", "mesh", "_ttds_", "_em_", "h55_survivor_m_ttds_hu",
+    "phantom", "pet", "summon", "decoy", "trap",
+    "crow", "em_crow", "butcher_em", "zbs"
+};
+
+inline bool IsFakeHunter(const char* name) {
+    const char* fakes[] = {
+        "mirror", "crow", "patroller", "peeper", "tentacle",
+        "note", "robot", "phantom", "clone", "decoy", "trap", "pet",
+        "em_crow", "em65", "butcher_em",
+        // 新增以下关键词：
+        "umbrella", "parasol", "buzz", "bird"
+    };
+    for (const char* f : fakes) {
+        if (strstr(name, f)) return true;
+    }
+    return false;
+}
+
+GameDataBuffer g_buffer[3];
+std::atomic<int> g_read_index{ 0 };
+std::atomic<int> g_write_index{ 1 };
+
 bool permeate_record = false;
 bool permeate_record_ini = false;
-struct Last_ImRect LastCoordinate = {0, 0, 0, 0};
+Last_ImRect LastCoordinate = { 0, 0, 0, 0 };
 static uint32_t orientation = -1;
-ANativeWindow *window; 
-// 屏幕信息
+ANativeWindow* window = nullptr;
+ImGuiWindow* g_window = nullptr;
+std::unique_ptr<AndroidImgui> graphics;
+
 android::ANativeWindowCreator::DisplayInfo displayInfo;
-// 窗口信息
-ImGuiWindow *g_window;
-// 绝对屏幕X _ Y
 int abs_ScreenX, abs_ScreenY;
 int native_window_screen_x, native_window_screen_y;
-std::unique_ptr<AndroidImgui>  graphics;
-ImFont* zh_font = NULL;
-ImFont* icon_font_0 = NULL;
-ImFont* icon_font_1 = NULL;
-ImFont* icon_font_2 = NULL;
-float 矩阵视野距离;
-bool M_Android_LoadFont(float SizePixels) {
-    ImGuiIO &io = ImGui::GetIO();
-    
-    // 使用内嵌字体（兼容Android 15/16）
-    ImFontConfig config;
-    config.FontDataOwnedByAtlas = false;
-    config.SizePixels = SizePixels;
-    config.OversampleH = 1;
-    ::zh_font = io.Fonts->AddFontFromMemoryTTF((void *)OPPOSans_H, OPPOSans_H_size, SizePixels, &config, io.Fonts->GetGlyphRangesChineseFull());    
+ImFont* zh_font = nullptr;
 
-	static const ImWchar icons_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
-    ImFontConfig icons_config;
-    icons_config.MergeMode = true;
-    icons_config.PixelSnapH = true;
-    icons_config.OversampleH = 3.0;
-    icons_config.OversampleV = 3.0;		
-    icons_config.SizePixels = SizePixels;
-	::icon_font_0 = io.Fonts->AddFontFromMemoryCompressedTTF((const void *)&font_awesome_brands_compressed_data, sizeof(font_awesome_brands_compressed_data), 0.0f, &icons_config, icons_ranges);
-	::icon_font_1 = io.Fonts->AddFontFromMemoryCompressedTTF((const void *)&font_awesome_regular_compressed_data, sizeof(font_awesome_regular_compressed_data), 0.0f, &icons_config, icons_ranges);
-	::icon_font_2 = io.Fonts->AddFontFromMemoryCompressedTTF((const void *)&font_awesome_solid_compressed_data, sizeof(font_awesome_solid_compressed_data), 0.0f, &icons_config, icons_ranges);
+uintptr_t libbase = 0;
+uintptr_t Matrix = 0, Arrayaddr = 0;
+uintptr_t 自身 = 0;
 
-    io.Fonts->AddFontDefault();
-    return zh_font != nullptr;
+float px = 0.0f;
+float py = 0.0f;
+long int MatrixOffset = 0;
+long int ArrayaddrOffset = 0;
+float 距离比例 = 11.886f;
+float matrix[16];
+Vector3A Z;
+int 自身阵营 = 0;
+char 自身名字[64] = "None";
+
+// ================== 默认状态 ==================
+static bool show_draw_line = false;
+static bool show_draw_Prop = false;
+static bool show_draw_prophet = true;
+static bool show_draw_secret_mechine = false;
+static bool enable_arms_factory = false;
+static bool Debugging = false;
+static bool inform_ghost = true;
+static bool show_window = true;
+static bool voice = true;
+
+static float map_display_size = 380.0f;
+static float map_pos_x = 80.0f;
+static float map_pos_y = 20.0f;
+static int g_manual_map_index = 0;
+GLuint g_map_texture_id = 0;
+int g_loaded_map_index = -1;
+char g_map_status_text[256] = "等待加载...";
+
+static const MapConfig Maps[] = {
+    { 743.045f, 2300.048f, 610.952f, 2392.805f, true, "军工厂", 3, 3 },
+    { -675.63f, 807.0f, -730.0f, 743.0f, false, "红教堂", 3, 3 },
+    { -675.0f, 782.0f, -856.0f, 709.0f, true, "圣心医院", 3, 3 },
+    { -910.0f, 980.0f, -856.0f, 958.0f, false, "湖景村", 4, 3 },
+    { -1058.0f, 1052.0f, -610.0f, 618.0f, false, "月亮河公园", 4, 3 },
+    { 765.0f, 2317.0f, 600.0f, 2391.0f, true, "里奥的回忆", 3, 3 },
+    { -46.0f, 1458.0f, -1187.0f, 605.0f, true, "永眠镇", 4, 3 },
+    { -785.0f, 805.0f, -723.0f, 709.0f, false, "唐人街", 3, 3 },
+    { -753.0f, 750.0f, -700.0f, 730.0f, false, "不归林", 3, 3 }
+};
+
+char 监管者预知[1024] = { 0 };
+char extractedString[64] = { 0 };
+int 状态 = 0;
+int 遍历次数 = 0;
+
+size_t get_memory_usage_kb() {
+    FILE* file = fopen("/proc/self/statm", "r");
+    if (!file) return 0;
+    size_t size = 0, resident = 0;
+    fscanf(file, "%zu %zu", &size, &resident);
+    fclose(file);
+    return resident * 4;
 }
 
-// 获取 Android 系统版本
-static int get_android_version() {
-    char version_str[128] = {0};
-    __system_property_get("ro.build.version.release", version_str);
-    if (version_str[0] == '\0') return 0;
-    return atoi(version_str);
-}
-
-void init_My_drawdata() {
-    int android_version = get_android_version();
-    if (android_version >= 15) {
-        // Android 15 及以上：使用内嵌字体（系统字体访问受限）
-        M_Android_LoadFont(24.0f);
-    } else {
-        // Android 14 及以下：使用系统字体
-        ImGui::My_Android_LoadSystemFont(25.0f);
-        M_Android_LoadFont(25.0f);
+inline bool should_filter(const std::string& name) {
+    for (const auto& keyword : g_filter_keywords) {
+        if (name.find(keyword) != std::string::npos) return true;
     }
+    return false;
 }
-
 
 void screen_config() {
     ::displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
 }
 
-void drawBegin() {
-    if (::permeate_record_ini) {
-        LastCoordinate.Pos_x = ::g_window->Pos.x;
-        LastCoordinate.Pos_y = ::g_window->Pos.y;
-        LastCoordinate.Size_x = ::g_window->Size.x;
-        LastCoordinate.Size_y = ::g_window->Size.y;
-
-        graphics->Shutdown();
-        android::ANativeWindowCreator::Destroy(::window);
-        ::window = android::ANativeWindowCreator::Create("逆天改命", native_window_screen_x, native_window_screen_y, permeate_record);
-        graphics->Init_Render(::window, native_window_screen_x, native_window_screen_y);
-        ::init_My_drawdata(); //初始化绘制数据
-    } 
-
-    screen_config();
-    if (::orientation != displayInfo.orientation) {
-        ::orientation = displayInfo.orientation;
-        Touch::setOrientation(displayInfo.orientation);
-        if (g_window != NULL) {
-            g_window->Pos.x = 100;
-            g_window->Pos.y = 125;        
-        }        
-        //cout << " width:" << displayInfo.width << " height:" << displayInfo.height << " orientation:" << displayInfo.orientation << endl;
-    }
-}
-
-struct Vector3A
-{
-	float X;
-	float Y;
-	float Z;
-
-	  Vector3A()
-	{
-		this->X = 0;
-		this->Y = 0;
-		this->Z = 0;
-	}
-
-	Vector3A(float x, float y, float z)
-	{
-		this->X = x;
-		this->Y = y;
-		this->Z = z;
-	}
-
-};
-
-float xs_prime_mirror, ys_prime_mirror;
-float xs_final, ys_final;
-void calculate_mirror_reflection(float x1, float y1, float x2, float y2, float xs, float ys, float *xs_prime, float *ys_prime) {
-    float xm = (x1 + x2) / 2.0;
-    float ym = (y1 + y2) / 2.0;
-
-    *xs_prime = 2.0 * xm - xs;
-    *ys_prime = 2.0 * ym - ys;
-}
-
-void calculate_line_reflection(float x1, float y1, float x2, float y2, float xs, float ys, float *xs_prime, float *ys_prime) {
-    float A = y2 - y1;
-    float B = x1 - x2;
-    float C = x2 * y1 - x1 * y2;
-
-    float D = A * xs + B * ys + C;
-    float denom = A * A + B * B;
-
-    *xs_prime = xs - 2.0 * A * D / denom;
-    *ys_prime = ys - 2.0 * B * D / denom;
-}
-
-
-uintptr_t libbase;
-uintptr_t Arrayaddr, Count, Matrix;
-uintptr_t 对象,对象阵营,自身,自身阵营,namezfcz,namezfc;
-uintptr_t 红夫人 = 0, 红夫人镜像 = 0, 镜子 = 0, 捏镜子 = 0;  // 初始化为0
-int zfcz,zfc;
-float 过滤矩阵[17];
-float matrix[16];
-float angle;
-
-static bool show_draw_Prop = true;//道具
-static bool show_draw_prophet = true;//预知监管者
-static bool redqueenmod = false;//红夫人模式
-static bool show_draw_sender = true;//密码机进度
-static bool show_draw_secret_mechine = false;//密码机位置
-
-static bool show_draw_ClassName = false;//类名
-static bool Debugging = false;//调试
-static bool mirror = false;//镜子状态
-static bool show_demo_window = false;
-static bool show_another_window = false;
-static bool inform_ghost = true;
-
-float z_x, z_y, z_z, d_x, d_y, d_z, camera, r_x, r_y, r_w;
-float X1,Y1,X2,Y2,W,H,MIDDLE,TOP,BOTTOM;
-float 距离;	
-char objtext[256];
-//char content[1024];
-char Team[1024];
-char Name[1024];
-char 监管者预知[1024];
-char fullnameof[1024];
-float px,py;
-Vector3A D,Z,M;
-
-ImColor 红色 = ImColor(250,0,0,255);
-ImColor 绿色 = ImColor(0,255,0,255);
-ImColor 蓝色 = ImColor(0,0,255,255);
-ImColor 黄色 = ImColor(255,255,0,255);
-ImColor 紫色 = ImColor(255,0,255,255);
-ImColor 黑色 = ImColor(0,0,0,255);
-ImColor 浅蓝色=ImColor(0, 191, 255, 255);
-ImColor BoneColor = ImColor(255,0,0,255);
-ImColor BotBoneColor = ImColor(255,255,255,255);
-int 状态 = 0;
-int 数据获取状态 = 0;
-int 遍历次数=0;
-char extractedString[64];
-long int MatrixOffset = 0,ArrayaddrOffset = 0;
-typedef struct {
-    unsigned long addr;
-    unsigned long taddr;
-} ModuleBssInfo;
-
-// 读取 /proc/[pid]/maps 中的内容
-int read_process_maps(int pid, char *filename, char *line, size_t line_size) {
-    FILE *fp = fopen(filename, "r");
-    if (fp == NULL) {
-        return -1; // 打开文件失败
-    }
-
-    while (fgets(line, line_size, fp) != NULL) {
-        if (strstr(line, "r-xp") != NULL || strstr(line, "rw") != NULL) {
-            fclose(fp);
-            return 0; // 找到文件并成功读取
-        }
-    }
-    fclose(fp);
-    return -1; // 未找到内容
-}
-
-// 提取模块的地址范围
-ModuleBssInfo extract_module_info(const char *line) {
-    ModuleBssInfo info = {0, 0};
-    long addr, taddr;
-    if (sscanf(line, "%lx-%lx", &addr, &taddr) == 2) {
-        info.addr = addr;
-        info.taddr = taddr;
-    }
-    return info;
-}
-
-// 获取指定进程中的模块BSS信息
-ModuleBssInfo get_module_bss(int pid, const char *module_name) {
-    char filename[64];
-    char line[1024];
+long get_module_base(int pid, const char* module_name) {
+    char filename[64], line[1024];
     snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-
-    ModuleBssInfo info = {0, 0};
-    int found_module = 0;
-
-    FILE *fp = fopen(filename, "r");
-    if (fp == NULL) {
-        return info;
-    }
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, module_name)) {
-            found_module = 1;
-        }
-
-        if (found_module) {
-            // 查找符合条件的 rw 权限行
-            if (strstr(line, "rw") != NULL && strlen(line) < 86) {
-                ModuleBssInfo temp_info = extract_module_info(line);
-                if ((temp_info.taddr - temp_info.addr) / 4096 >= 2800) {
-                    fclose(fp);
-                    return temp_info;
-                }
-            }
-        }
-    }
-    fclose(fp);
-    return info;
-}
-
-long get_module_base(int pid, const char *module_name)
-{
+    FILE* fp = fopen(filename, "r");
     long addr = 0;
-    char filename[64];
-    char line[1024];
-    
-    snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-    
-    FILE *fp = fopen(filename, "r");
-    if (fp != NULL)
-    {
-        while (fgets(line, sizeof(line), fp))
-        {
-            if (strstr(line, module_name))
-            {
+    if (fp) {
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, module_name)) {
                 sscanf(line, "%lx-%*lx", &addr);
                 break;
             }
@@ -362,773 +205,479 @@ long get_module_base(int pid, const char *module_name)
     return addr;
 }
 
-// 获取进程ID
-int get_name_pid1(const char *packageName) {
-    DIR *dir = opendir("/proc");
+struct ModuleBssInfo { unsigned long addr; unsigned long taddr; };
+ModuleBssInfo get_module_bss(int pid, const char* module_name) {
+    char filename[64], line[1024];
+    snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
+    ModuleBssInfo info = { 0, 0 };
+    FILE* fp = fopen(filename, "r");
+    if (!fp) return info;
+    bool found_module = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, module_name)) found_module = true;
+        if (found_module && strstr(line, "rw") && strlen(line) < 86) {
+            long addr, taddr;
+            if (sscanf(line, "%lx-%lx", &addr, &taddr) == 2) {
+                if ((taddr - addr) / 4096 >= 2800) {
+                    info.addr = addr; info.taddr = taddr;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    return info;
+}
+
+int get_name_pid1(const char* packageName) {
+    DIR* dir = opendir("/proc");
     if (!dir) return -1;
-
-    struct dirent *entry;
-    FILE *fp;
-    char filename[64];
-    char cmdline[64];
+    struct dirent* entry;
+    char filename[64], cmdline[64];
     int id = -1;
-
     while ((entry = readdir(dir)) != NULL) {
         id = atoi(entry->d_name);
-        if (id != 0) {
-            snprintf(filename, sizeof(filename), "/proc/%d/cmdline", id);
-            fp = fopen(filename, "r");
-            if (fp) {
-                fgets(cmdline, sizeof(cmdline), fp);
-                fclose(fp);
+        if (id == 0) continue;
+        snprintf(filename, sizeof(filename), "/proc/%d/cmdline", id);
+        FILE* fp = fopen(filename, "r");
+        if (fp) {
+            if (fgets(cmdline, sizeof(cmdline), fp)) {
                 if ((strstr(cmdline, packageName) != NULL || strstr(cmdline, "com.netease.idv") != NULL) &&
-                    strstr(cmdline, "com") != NULL && strstr(cmdline, "PushService") == NULL && strstr(cmdline, "gcsdk") == NULL) {
-                    sprintf(extractedString, "%s", cmdline);
+                    strstr(cmdline, "com") != NULL && !strstr(cmdline, "PushService") && !strstr(cmdline, "gcsdk")) {
+                    snprintf(extractedString, sizeof(extractedString), "%s", cmdline);
+                    fclose(fp);
                     closedir(dir);
                     return id;
                 }
             }
+            fclose(fp);
         }
     }
     closedir(dir);
     return -1;
 }
 
-// ============== 线程CPU亲和性设置（小核优化） ==============
-static long getCpuMaxFreqForThread(int cpu) {
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
-    FILE* file = fopen(path, "r");
-    if (!file) return -1;
-    long freq = 0;
-    fscanf(file, "%ld", &freq);
-    fclose(file);
-    return freq;
+bool GetEntityPosition(const DataStruct& obj, Vector3A& pos) {
+    pos.X = getFloat(obj.objcoor + 0xA0);
+    pos.Y = getFloat(obj.objcoor + 0xA8);
+    pos.Z = getFloat(obj.objcoor + 0xA4);
+    if (fabs(pos.X) < 1e-4 && fabs(pos.Y) < 1e-4 && fabs(pos.Z) < 1e-4) return false;
+    return true;
 }
 
-static void setThreadToLittleCore() {
-    cpu_set_t cpuSet;
-    CPU_ZERO(&cpuSet);
-    
-    // 获取CPU核心数
-    int numCpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (numCpus <= 0) numCpus = 8;
-    if (numCpus > 16) numCpus = 16;
-    
-    long freqs[16] = {0};
-    long minFreq = LONG_MAX;
-    long maxFreq = 0;
-    
-    // 获取所有核心的最大频率
-    for (int i = 0; i < numCpus; i++) {
-        freqs[i] = getCpuMaxFreqForThread(i);
-        if (freqs[i] > 0) {
-            if (freqs[i] < minFreq) minFreq = freqs[i];
-            if (freqs[i] > maxFreq) maxFreq = freqs[i];
+bool ShouldSkipEntity(const DataStruct& obj, const Vector3A& pos) {
+    if (pos.Z <= -300.0f) return true;
+    if (should_filter(obj.类名)) return true;
+    int checkVal = getDword(obj.obj + Offsets::OBJ_CHECK_OFFSET);       // 0x70
+    float checkFloat = getFloat(obj.obj + Offsets::OBJ_CHECK_OFFSET_2); // 0x1A0
+
+    // 2. 定义什么是幽灵：如果不等于有效值(0x1000000) 或 浮点数不对(450.0)，则视为幽灵/无效
+    // 引用源码：if ( (_DWORD)v130 != 0x1000000 ) goto LABEL_67; [cite: 144]
+    // 引用源码：if ( *(float *)&v130 != 450.0 ) goto LABEL_67; [cite: 148]
+    bool is_ghost_obj = (checkVal != Offsets::VALID_ACTOR_VALUE || checkFloat != Offsets::VALID_ACTOR_FLOAT);
+
+    // 3. 替换原本的 if (jxpd == Offsets::GHOST_VALUE)
+    if (is_ghost_obj) {
+        // 逻辑 A: 如果没开启“显示幽灵”功能，直接返回 true (过滤掉)
+        if (!inform_ghost) return true;
+
+        // 逻辑 B: 即使开启了显示幽灵，如果是以下特定的监管者，依然返回 true (过滤掉)
+        // (保留了你原版的特殊过滤列表)
+        if (strstr(obj.str, "红蝶") || strstr(obj.str, "无常") ||
+            strstr(obj.str, "歌剧") || strstr(obj.str, "破轮") || strstr(obj.str, "木偶") || strstr(obj.str, "冒险家")) {
+            return true;
         }
     }
-    
-    // 计算小核阈值
-    long threshold = (minFreq + maxFreq) / 2;
-    int count = 0;
-    
-    for (int i = 0; i < numCpus; i++) {
-        if (freqs[i] > 0 && freqs[i] <= threshold) {
-            CPU_SET(i, &cpuSet);
-            count++;
-        }
-    }
-    
-    // 如果检测失败，默认使用前4个核心
-    if (count == 0) {
-        int defaultLittle = (numCpus > 4) ? 4 : numCpus;
-        for (int i = 0; i < defaultLittle; i++) {
-            CPU_SET(i, &cpuSet);
-        }
-    }
-    
-    pid_t tid = syscall(__NR_gettid);  // Android 兼容的获取线程ID方式
-    sched_setaffinity(tid, sizeof(cpuSet), &cpuSet);
-    nice(5);  // 降低线程优先级
+    return false;
 }
 
-int c;
-char libso[256] = {"libclient.so"};
+bool M_Android_LoadFont(float SizePixels) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+    ImFontConfig config;
+    config.FontDataOwnedByAtlas = false;
+    config.MergeMode = false;
+    ::zh_font = io.Fonts->AddFontFromMemoryTTF((void*)OPPOSans_H, OPPOSans_H_size, SizePixels, &config, io.Fonts->GetGlyphRangesChineseFull());
+    static const ImWchar icons_ranges[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
+    ImFontConfig icons_config;
+    icons_config.MergeMode = true;
+    icons_config.PixelSnapH = true;
+    io.Fonts->AddFontFromMemoryCompressedTTF((const void*)&font_awesome_brands_compressed_data, sizeof(font_awesome_brands_compressed_data), SizePixels, &icons_config, icons_ranges);
+    io.Fonts->AddFontFromMemoryCompressedTTF((const void*)&font_awesome_regular_compressed_data, sizeof(font_awesome_regular_compressed_data), SizePixels, &icons_config, icons_ranges);
+    io.Fonts->AddFontFromMemoryCompressedTTF((const void*)&font_awesome_solid_compressed_data, sizeof(font_awesome_solid_compressed_data), SizePixels, &icons_config, icons_ranges);
+    return zh_font != nullptr;
+}
+
+void init_My_drawdata() {
+    ImGui::My_Android_LoadSystemFont(25.0f);
+    M_Android_LoadFont(25.0f);
+}
+
+void ResetMapTextureState() {
+    g_map_texture_id = 0;
+    g_loaded_map_index = -1;
+    snprintf(g_map_status_text, sizeof(g_map_status_text), "上下文已重置");
+}
+
+void drawBegin() {
+    screen_config();
+    if (::orientation != displayInfo.orientation) {
+        ::orientation = displayInfo.orientation;
+        Touch::setOrientation(displayInfo.orientation);
+        if (g_window) { g_window->Pos.x = 100; g_window->Pos.y = 125; }
+    }
+    if (permeate_record_ini) {
+        LastCoordinate = { g_window->Pos.x, g_window->Pos.y, g_window->Size.x, g_window->Size.y };
+        graphics->Shutdown();
+        android::ANativeWindowCreator::Destroy(window);
+        window = android::ANativeWindowCreator::Create("Acid5!", displayInfo.width, displayInfo.height, permeate_record);
+        graphics->Init_Render(window, displayInfo.width, displayInfo.height);
+        ResetMapTextureState();
+        init_My_drawdata();
+    }
+}
+
+// ================== 核心扫描线程 (恢复原始特征) ==================
 void read_thread(long int PD1, long int PD2, long int PD3) {
-    // 将读取线程也绑定到小核，减少大核占用
-    setThreadToLittleCore();
-    
-    ModuleBssInfo result;
-    
-    // 循环获取进程ID和模块地址，直到都有效为止
-    while (true) {
-        // 尝试获取进程ID
+    pid = -1;
+    while (pid == -1) {
         pid = get_name_pid1("dwrg");
-        if (pid == -1) {
-            状态 = 0;
-            sleep(2);  // 每2秒重试一次
-            continue;
-        }
-        
-        // 成功获取进程ID后，获取包名和模块地址
-        get_name_pid(extractedString);
-        
-        if (strstr(extractedString, "com.netease.idv") != NULL) {
-            libbase = get_module_base(pid, ".");
-            result = get_module_bss(pid, ".");
-        } else {
-            libbase = get_module_base(pid, libso);
-            result = get_module_bss(pid, libso);
-        }
-        
-        // 检查模块地址是否有效
-        if (libbase != 0 && result.addr != 0) {
-            break;  // 成功获取进程ID和模块地址
-        }
-        
-        // 模块地址无效，可能游戏刚启动，模块还未加载完成
-        状态 = 0;
-        sleep(2);  // 等待后重试
+        if (pid == -1) sleep(1);
     }
-
-    c = (result.taddr - result.addr) / 4096;
-    long buff[512];  // 缓存指针数据
-
-    // 搜索 MatrixOffset 和 ArrayaddrOffset
+    get_name_pid(extractedString);
+    ModuleBssInfo result;
+    if (strstr(extractedString, "com.netease.idv") != NULL) {
+        libbase = get_module_base(pid, "."); result = get_module_bss(pid, ".");
+    }
+    else {
+        libbase = get_module_base(pid, "libclient.so"); result = get_module_bss(pid, "libclient.so");
+    }
+    int c = (result.taddr - result.addr) / 4096;
+    unsigned long buff[512];
     while (MatrixOffset == 0 || ArrayaddrOffset == 0) {
         状态 = 1;
-        bool found_both = false;
-        
-        for (int i = 0; i < c && !found_both; i++) {
+        for (int i = 0; i < c; i++) {
             vm_readv(result.addr + (i * 4096), &buff, 0x1000);
             for (int ii = 0; ii < 512; ii++) {
-                // 仅在 MatrixOffset 未找到时搜索
-                if (MatrixOffset == 0 && buff[ii] != 0) {
-                    int tempMatrix = getDword(getPtr64(buff[ii] + Offsets::MATRIX_PTR_1) + Offsets::MATRIX_FEATURE_OFFSET);
-                    if (tempMatrix == Offsets::MATRIX_FEATURE_1 || tempMatrix == Offsets::MATRIX_FEATURE_2) {
-                        MatrixOffset = result.addr - libbase + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE;
-                    }
+                unsigned long val = buff[ii];
+                long int CurrentAddr = result.addr + (i * 4096) + (ii * 8);
+                if (val == 0x656A624F72655028) {
+                    if (getDword(CurrentAddr + 304) == 257) MatrixOffset = CurrentAddr - libbase + 768;
                 }
+                if (val == 16384) {
+                    if (getFloat(CurrentAddr - 16) == 1.0f && getDword(CurrentAddr - 8) == 257)
+                        ArrayaddrOffset = CurrentAddr - libbase + 56;
+                }
+            }
+        }
+        if (MatrixOffset != 0 && ArrayaddrOffset != 0) { 状态 = 2; break; }
+        遍历次数++; sleep(2);
+    }
+    char temp_name[128]; std::string s_prophet;
+    while (true) {
+        uintptr_t ArrayStruct = libbase + ArrayaddrOffset;
+        uintptr_t StartPtr = getPtr64(ArrayStruct);
+        uintptr_t EndPtr = getPtr64(ArrayStruct + 8);
+        long count = 0;
+        if (StartPtr > 0 && EndPtr > StartPtr) count = (EndPtr - StartPtr) / 8;
+        if (count > 2000) count = 2000;
+        int read_idx = g_read_index.load(std::memory_order_acquire);
+        int last_write = g_write_index.load(std::memory_order_relaxed);
+        int free_idx = 0;
+        for (int i = 0; i < 3; i++) if (i != read_idx && i != last_write) { free_idx = i; break; }
+        GameDataBuffer& buffer = g_buffer[free_idx];
+        int count_valid = 0; s_prophet.clear();
+        for (int ii = 0; ii < count; ii++) {
+            if (count_valid >= 1999) break;
+            uintptr_t objPtr = getPtr64(StartPtr + ii * 8);
+            if (objPtr == 0) continue;
+            uintptr_t component_ptr = getPtr64(objPtr + 0x28);
+            if (component_ptr == 0) continue;
+            uintptr_t name_struct = getPtr64(getPtr64(getPtr64(getPtr64(getPtr64(objPtr + 0xF8) + 0x0) + 0x8) + 0x20) + 0x20);
+            if (name_struct == 0) continue;
+            int name_len = getDword(name_struct + 0x10);
+            uintptr_t name_val_ptr = getPtr64(name_struct + 0x8);
+            if (name_val_ptr != 0 && name_len > 0 && name_len < 128) {
+                vm_readv(name_val_ptr, temp_name, name_len); temp_name[name_len] = '\0';
+            }
+            else continue;
+            if (should_filter(temp_name)) continue;
+            DataStruct& item = buffer.data[count_valid];
+            item.obj = objPtr; item.objcoor = component_ptr;
+            strcpy(item.类名, temp_name); item.阵营 = 0; bool added = false;
+            if (strstr(temp_name, "boss")) {
+                if (IsFakeHunter(temp_name)) continue;
+                strcpy(item.str, getboss(temp_name)); item.阵营 = 1; added = true;
+                if (s_prophet.find(item.str) == std::string::npos && !strstr(item.str, "butcher")) s_prophet += std::string(item.str) + " ";
+            }
+            else if (strstr(temp_name, "player")) {
+                strcpy(item.str, getplayer(temp_name)); item.阵营 = 2; added = true;
+            }
+            else if (strstr(temp_name, "scene_sender") && strstr(temp_name, "low")) {
+                item.阵营 = 3; strcpy(item.str, "密码机"); added = true;
+            }
+            else if (strstr(temp_name, "prop_76")) {
+                item.阵营 = 3; strcpy(item.str, "地窖"); added = true;
+            }
+            else if (strstr(temp_name, "prop")) {
+                item.阵营 = 4; strcpy(item.str, "道具"); added = true;
+            }
+            if (added) count_valid++;
+        }
+        snprintf(监管者预知, sizeof(监管者预知), "%s", s_prophet.c_str());
+        buffer.数量 = count_valid;
+        g_write_index.store(free_idx, std::memory_order_relaxed);
+        g_read_index.store(free_idx, std::memory_order_release);
+        usleep(15000);
+    }
+}
 
-                // 仅在 ArrayaddrOffset 未找到时搜索
-                if (ArrayaddrOffset == 0 && buff[ii] == Offsets::ARRAY_FEATURE_1) {
-                    int tempszz = getDword(result.addr + 4096 * i + Offsets::ARRAY_ELEMENT_SIZE * ii - Offsets::ARRAY_PREV_CHECK);
-                    if (tempszz == Offsets::ARRAY_FEATURE_2 && getPtr64(result.addr + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE + Offsets::ARRAY_CHECK_OFFSET) == (result.addr + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE + Offsets::ARRAY_SELF_REF)) {
-                        ArrayaddrOffset = result.addr - libbase + i * 4096 + ii * Offsets::ARRAY_ELEMENT_SIZE + Offsets::ARRAY_ADDR_OFFSET;
+void DrawCenteredText(ImDrawList* Draw, const ImVec2& pos, const ImColor& color, const char* text) {
+    if (!text || text[0] == '\0') return;
+    ImVec2 textSize = ImGui::CalcTextSize(text);
+    Draw->AddText({ pos.x - textSize.x / 2.0f, pos.y }, color, text);
+}
+
+void LoadMapTexture(int index) {
+    if (index == g_loaded_map_index && g_map_texture_id != 0) return;
+    if (g_map_texture_id != 0) { glDeleteTextures(1, &g_map_texture_id); g_map_texture_id = 0; }
+    char path[256]; snprintf(path, sizeof(path), "/sdcard/maps/%d.png", index);
+    int w, h, n; unsigned char* data = stbi_load(path, &w, &h, &n, 4);
+    if (data) {
+        glGenTextures(1, &g_map_texture_id);
+        if (g_map_texture_id != 0) {
+            glBindTexture(GL_TEXTURE_2D, g_map_texture_id);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+            stbi_image_free(data); g_loaded_map_index = index;
+            snprintf(g_map_status_text, sizeof(g_map_status_text), "加载成功");
+        }
+        else stbi_image_free(data);
+    }
+    else snprintf(g_map_status_text, sizeof(g_map_status_text), "文件未找到");
+}
+
+void Draw_UnifiedMap(ImDrawList* Draw, const MapConfig& cfg) {
+    if (!enable_arms_factory) return;
+    float worldXSpan = cfg.maxX - cfg.minX, worldYSpan = cfg.maxY - cfg.minY;
+    float map_h = map_display_size, map_w = cfg.isVerticalMap ? (map_h * (worldYSpan / worldXSpan)) : (map_h * (worldXSpan / worldYSpan));
+    ImVec2 map_pos = { map_pos_x, map_pos_y }, map_end = { map_pos.x + map_w, map_pos.y + map_h };
+    LoadMapTexture(g_manual_map_index);
+    if (g_map_texture_id != 0) Draw->AddImage((void*)(intptr_t)g_map_texture_id, map_pos, map_end);
+    else Draw->AddRectFilled(map_pos, map_end, ImColor(0, 0, 0, 200), 5.0f);
+    Draw->AddRect(map_pos, map_end, ImColor(255, 255, 255, 120), 5.0f, 0, 1.2f);
+    int read_idx = g_read_index.load(std::memory_order_acquire);
+    const GameDataBuffer& buf = g_buffer[read_idx];
+    auto GetMapPos = [&](const Vector3A& p) -> ImVec2 {
+        float nX = cfg.isVerticalMap ? (cfg.maxY - p.Y) / worldYSpan : (p.X - cfg.minX) / worldXSpan;
+        float nY = cfg.isVerticalMap ? (cfg.maxX - p.X) / worldXSpan : (cfg.maxY - p.Y) / worldYSpan;
+        return { map_pos.x + nX * map_w, map_pos.y + nY * map_h };
+        };
+    for (int layer = 1; layer <= 3; layer++) {
+        for (int i = 0; i < buf.数量; i++) {
+            const DataStruct& obj = buf.data[i]; Vector3A pos;
+            if (!GetEntityPosition(obj, pos)) continue;
+            if (obj.obj != 自身 && ShouldSkipEntity(obj, pos)) continue;
+            ImVec2 p = GetMapPos(pos);
+            if (layer == 1 && obj.阵营 == 3 && strstr(obj.类名, "sender")) Draw->AddRect({ p.x - 10, p.y - 10 }, { p.x + 10, p.y + 10 }, COL_YELLOW, 0, 0, 2.0f);
+            else if (layer == 2 && obj.阵营 == 3 && strstr(obj.类名, "prop_76")) Draw->AddRect({ p.x - 8, p.y - 8 }, { p.x + 8, p.y + 8 }, COL_PURPLE, 0, 0, 1.5f);
+            else if (layer == 3) {
+                if (obj.obj == 自身) {
+                    float angle = atan2f(matrix[10], matrix[8]) + (cfg.isVerticalMap ? 1.57f : 3.14f);
+                    Draw->PathLineTo(p); Draw->PathArcTo(p, 180.0f, angle - 0.7f, angle + 0.7f, 30);
+                    Draw->PathFillConvex(ImColor(0, 191, 255, 30));
+                    static Vector3A last_pos = { 0, 0, 0 }; static float move_angle = 0.0f;
+                    float dist_sq = pow(pos.X - last_pos.X, 2) + pow(pos.Y - last_pos.Y, 2);
+                    if (dist_sq > 0.8f) {
+                        ImVec2 p_now = GetMapPos(pos), p_last = GetMapPos(last_pos);
+                        float mdx = p_now.x - p_last.x, mdy = p_now.y - p_last.y;
+                        if (mdx * mdx + mdy * mdy > 0.01f) move_angle = atan2f(mdy, mdx);
+                        last_pos = pos;
                     }
+                    float arrow_size = 20.0f;
+                    ImVec2 p1 = { p.x + arrow_size * cosf(move_angle), p.y + arrow_size * sinf(move_angle) };
+                    ImVec2 p2 = { p.x + arrow_size * 0.7f * cosf(move_angle + 2.5f), p.y + arrow_size * 0.7f * sinf(move_angle + 2.5f) };
+                    ImVec2 p3 = { p.x + arrow_size * 0.7f * cosf(move_angle - 2.5f), p.y + arrow_size * 0.7f * sinf(move_angle - 2.5f) };
+                    Draw->AddTriangleFilled(p1, p2, p3, COL_LIGHT_BLUE); Draw->AddTriangle(p1, p2, p3, COL_WHITE, 1.5f);
                 }
-                
-                // 两个都找到了，提前退出
-                if (MatrixOffset != 0 && ArrayaddrOffset != 0) {
-                    found_both = true;
+                else if (obj.阵营 == 1) Draw->AddCircleFilled(p, 12.0f, COL_RED);
+                else if (obj.阵营 == 2) Draw->AddCircleFilled(p, 6.0f, COL_GREEN);
+            }
+        }
+    }
+}
+
+void VolumeKeyHide() {
+    std::vector<int> fds; DIR* dir = opendir("/dev/input/");
+    if (dir) {
+        struct dirent* ptr; while ((ptr = readdir(dir)) != NULL) {
+            if (strstr(ptr->d_name, "event")) {
+                char path[64]; snprintf(path, sizeof(path), "/dev/input/%s", ptr->d_name);
+                int fd = open(path, O_RDWR | O_NONBLOCK); if (fd >= 0) fds.push_back(fd);
+            }
+        }
+        closedir(dir);
+    }
+    struct input_event ev;
+    while (true) {
+        for (int fd : fds) {
+            while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                if (ev.type == EV_KEY && ev.value == 1) { if (ev.code == KEY_VOLUMEDOWN) voice = false; if (ev.code == KEY_VOLUMEUP) voice = true; }
+            }
+        }
+        show_window = voice; usleep(50000);
+    }
+}
+
+void Draw_Main(ImDrawList* Draw) {
+    int read_idx = g_read_index.load(std::memory_order_acquire);
+    const GameDataBuffer& buf = g_buffer[read_idx];
+    uintptr_t Step1_Addr = libbase + MatrixOffset;
+    uintptr_t Ptr1 = getPtr64(Step1_Addr); if (Ptr1 == 0) return;
+    uintptr_t Step2_Addr = Ptr1 + 0xA58; uintptr_t Ptr2 = getPtr64(Step2_Addr); if (Ptr2 == 0) return;
+    uintptr_t MatrixRealAddr = Ptr2 + 0x2C0; vm_readv(MatrixRealAddr, matrix, 16 * 4);
+    if (fabs(matrix[0]) < 0.0001f && fabs(matrix[1]) < 0.0001f) return;
+
+    if (show_draw_prophet && 监管者预知[0] != '\0') DrawCenteredText(Draw, { px, 130 }, COL_RED, 监管者预知);
+
+    // ================== 恢复原本自身锁定逻辑 ==================
+// ================== 优化后的自身锁定逻辑 (屏幕中心最近距离算法) ==================
+    bool found_self = false;
+    float min_center_dist = 9999.0f; // 用于记录离中心最近的距离
+    int best_candidate_index = -1;   // 最佳候选人的索引
+
+    for (int i = 0; i < buf.数量; i++) {
+        const DataStruct& obj = buf.data[i];
+
+        // 1. 基础过滤：必须是监管者(1)或求生者(2)
+        if (obj.阵营 != 2 && obj.阵营 != 1) continue;
+
+        // 2. 获取坐标
+        Vector3A pos;
+        if (!GetEntityPosition(obj, pos)) continue;
+
+        // 3. 计算相机 Z 深度 (Camera Z)
+        float cam_z = matrix[3] * pos.X + matrix[7] * pos.Z + matrix[11] * pos.Y + matrix[15];
+
+        // 4. 宽松的深度过滤：防止把自己过滤掉
+        // 正常视角下自身通常在 10~50 左右，但为了防止特殊情况，范围放宽一点
+        if (cam_z < 5.0f || cam_z > 80.0f) continue;
+
+        // 5. 读取标志位 (保留原有的校验逻辑，增加安全性)
+        int zy = 0;
+        vm_readv(obj.obj + 0xAA, &zy, 1);
+        if (!(zy & 1)) continue; // 如果校验位不对，跳过
+
+        // 6. 计算屏幕坐标 X (核心修改)
+        // 利用矩阵计算该对象在屏幕上的 X 位置
+        float r_x = px + (matrix[0] * pos.X + matrix[4] * pos.Z + matrix[8] * pos.Y + matrix[12]) / cam_z * px;
+
+        // 7. 计算离屏幕中心(px)的水平距离绝对值
+        float dist_from_center = fabsf(r_x - px);
+
+        // 8. 寻找“最中心”的那个对象
+        // 如果当前对象比之前的候选者更接近屏幕中心，则更新候选者
+        if (dist_from_center < min_center_dist) {
+            // 增加一个阈值限制，只有在屏幕中心左右一定范围内才会被判定为自己 (例如 150像素)
+            if (dist_from_center < 150.0f) {
+                min_center_dist = dist_from_center;
+                best_candidate_index = i;
+            }
+        }
+    }
+
+    // 9. 应用最佳结果
+    if (best_candidate_index != -1) {
+        const DataStruct& selfObj = buf.data[best_candidate_index];
+        GetEntityPosition(selfObj, Z); // 更新 Z 坐标为自身坐标
+        自身 = selfObj.obj;
+        自身阵营 = selfObj.阵营;
+        strcpy(自身名字, selfObj.str);
+        found_self = true;
+    }
+
+    // 保底逻辑：如果上面的算法没找到（比如正在上椅子视角极偏），才退化为取第一个求生者
+    if (!found_self) {
+        // 如果之前有锁定的自身且有效，保持不变，否则重置
+        if (Z.X == 0) {
+            for (int i = 0; i < buf.数量; i++) {
+                if (buf.data[i].阵营 == 2) {
+                    GetEntityPosition(buf.data[i], Z);
                     break;
                 }
             }
         }
-
-        if (found_both) {
-            break;
-        }
-        遍历次数++;
-        sleep(5);
     }
-    状态 = 2;
-    while (true)
-    {    
-        Arrayaddr = getPtr64(libbase + ArrayaddrOffset);    //数组
-        long int 测试 = getPtr64(libbase + ArrayaddrOffset+8);
-        Count = 2000;    //数组数量
-        
-        // 三缓冲：获取空闲的写入缓冲区
-        int read_idx = g_read_index.load(std::memory_order_acquire);
-        int last_write = g_write_index.load(std::memory_order_relaxed);
-        // 找到既不是当前读取的，也不是上次写入的缓冲区
-        int free_idx;
-        for (free_idx = 0; free_idx < 3; free_idx++) {
-            if (free_idx != read_idx && free_idx != last_write) break;
+
+    for (int i = 0; i < buf.数量; i++) {
+        const DataStruct& obj = buf.data[i]; if (obj.obj == 自身 && found_self) continue;
+        Vector3A pos; if (!GetEntityPosition(obj, pos)) continue;
+        if (ShouldSkipEntity(obj, pos)) continue;
+        float cam_z = matrix[3] * pos.X + matrix[7] * pos.Z + matrix[11] * pos.Y + matrix[15];
+        if (cam_z <= 0.1f) continue;
+        float dist = sqrt(pow(pos.X - Z.X, 2) + pow(pos.Y - Z.Y, 2) + pow(pos.Z - Z.Z, 2)) / 距离比例;
+        float r_x = px + (matrix[0] * pos.X + matrix[4] * pos.Z + matrix[8] * pos.Y + matrix[12]) / cam_z * px;
+        float r_y = py - (matrix[1] * pos.X + matrix[5] * (pos.Z + 0.0f) + matrix[9] * pos.Y + matrix[13]) / cam_z * py;
+        float r_w = py - (matrix[1] * pos.X + matrix[5] * (pos.Z + 20.0f) + matrix[9] * pos.Y + matrix[13]) / cam_z * py;
+        float h = r_y - r_w, w = h / 2.0f;
+        if (Debugging && obj.阵营 != 4) {
+            char buf_txt[256]; // 加大了缓冲区防止文字过长溢出
+
+            // 格式说明：[类名] X坐标, Y坐标, Z坐标
+            // 例如：[BP_Player_Wuchang_C] 105.0, -20.5, 30.0
+            snprintf(buf_txt, sizeof(buf_txt), "[%s] %.1f, %.1f, %.1f", obj.类名, pos.X, pos.Y, pos.Z);
+
+            DrawCenteredText(Draw, { r_x, r_y + 15 }, COL_YELLOW, buf_txt);
         }
-        if (free_idx >= 3) free_idx = (last_write + 1) % 3;  // 安全回退
-        
-        GameDataBuffer& write_buffer = g_buffer[free_idx];
-                             
-        int 指针数量=0;
-        int 红夫人模式=0;
-        static std::string s;           // 静态变量复用，避免每次分配
-        static std::string fullname;
-        s.clear();                      // 清空而不是重新构造
-        fullname.clear();
-        for (int ii = 0; ii < Count; ii++){
-            对象 = getPtr64(Arrayaddr + Offsets::ARRAY_ELEMENT_SIZE * ii);    // 遍历数量次数            
-                
-            if (对象 == 0)               
-                break;                                
-            
-            namezfcz = GET_CLASSNAME_PTR(对象);
-            int len = getDword(namezfcz + Offsets::CLASSNAME_LEN);
-            if (len>=256)                
-                continue;
-                
-            过滤类名.resize(0);
-            for (int i = 0; i < len; i+=24) {                
-                vm_readv(getPtr64(namezfcz)+i,gwd1,24);
-                gwd1[24] = '\0';
-                过滤类名 += gwd1;
-            }
-            
-            if (should_filter(过滤类名)) {
-                continue;  // 过滤随从等无关对象
-            }
-
-            
-            float pd1 = getFloat(对象 + Offsets::OBJ_CAMP);
-            float pd2 = getFloat(对象 + Offsets::OBJ_PD2);
-
-            int 过滤重复指针=0;
-            for (int i = 0; i < 指针数量; i++){
-                if(对象 == write_buffer.data[i].obj){
-                    过滤重复指针=1;
-                }                    
-            }
-            if (过滤重复指针 == 1){
-                continue;
-            }
-                
-            
-            // 使用 contains() 替代 strstr，更清晰且避免重复调用 c_str()
-            bool is_player = contains(过滤类名, "player");
-            bool is_boss = contains(过滤类名, "boss");
-            bool is_scene = contains(过滤类名, "scene");
-            bool is_prop = contains(过滤类名, "prop");
-            bool is_mirror = contains(过滤类名, "mirror");
-            
-            if (is_player || is_boss || pd1 == 450 || is_scene || is_prop || is_mirror || Debugging)
-            {
-                write_buffer.data[指针数量].obj = 对象;
-                if (is_boss) {
-                    strcpy(write_buffer.data[指针数量].str, getboss(过滤类名.c_str()));
-                    write_buffer.data[指针数量].阵营 = 1;
-                    strcpy(write_buffer.data[指针数量].类名, 过滤类名.c_str());
-                    write_buffer.data[指针数量].objcoor = getPtr64(对象 + Offsets::OBJ_COORD_PTR);
-                    指针数量++;
-                }
-                else if (is_player || contains(过滤类名, "npc_deluosi_dress_ghost") || contains(过滤类名, "huojian")) {
-                    strcpy(write_buffer.data[指针数量].str, getplayer(过滤类名.c_str()));
-                    write_buffer.data[指针数量].阵营 = 2;
-                    strcpy(write_buffer.data[指针数量].类名, 过滤类名.c_str());
-                    write_buffer.data[指针数量].objcoor = getPtr64(对象 + Offsets::OBJ_COORD_PTR);
-                    指针数量++;
-                }
-                else if (contains(过滤类名, "redqueen") && is_mirror && contains(过滤类名, "model")) {
-                    strcpy(write_buffer.data[指针数量].类名, 过滤类名.c_str());
-                    write_buffer.data[指针数量].objcoor = getPtr64(对象 + Offsets::OBJ_COORD_PTR);
-                    write_buffer.data[指针数量].阵营 = 5;
-                    指针数量++;
-                }
-                else {
-                    const char* scene_result = getscene(过滤类名.c_str());
-                    const char* prop_result = getprop(过滤类名.c_str());
-                    if (is_scene) {
-                        if (scene_result != NULL) {
-                            strcpy(write_buffer.data[指针数量].类名, 过滤类名.c_str());
-                            write_buffer.data[指针数量].objcoor = getPtr64(对象 + Offsets::OBJ_COORD_PTR);
-                            strcpy(write_buffer.data[指针数量].str, scene_result);
-                            write_buffer.data[指针数量].阵营 = 3;
-                            指针数量++;
-                        } else {
-                            continue;
-                        }
-                    }
-                    else if (is_prop && !contains(过滤类名, "woodpalne")) {
-                        if (prop_result != NULL) {
-                            strcpy(write_buffer.data[指针数量].类名, 过滤类名.c_str());
-                            write_buffer.data[指针数量].objcoor = getPtr64(对象 + Offsets::OBJ_COORD_PTR);
-                            strcpy(write_buffer.data[指针数量].str, prop_result);
-                            write_buffer.data[指针数量].阵营 = 4;
-                            指针数量++;
-                        } else {
-                            continue;
-                        }
-                    }
-                }
-            }
-            
-            // 预知监管者
-            if (show_draw_prophet && is_boss) {
-                std::string bossName = getboss(过滤类名.c_str());
-                if (s.find(bossName) == std::string::npos 
-                    && bossName.find("伊斯人") == std::string::npos 
-                    && bossName.find("信徒") == std::string::npos
-                    && bossName.find("厂长残火") == std::string::npos
-                    && bossName.find("butcher") == std::string::npos) {
-                    s += bossName + " ";
-                    fullname += 过滤类名;
-                    fullname += " | ";
-                }
-            }
-
-            // 处理红夫人模式
-            if (pd1 == Offsets::CAMP_VALUE) {
-                int jxpd = getDword(对象 + Offsets::OBJ_GHOST);
-                uintptr_t objcoor = getPtr64(对象 + Offsets::OBJ_COORD_PTR);  // 缓存指针，避免重复读取
-                float coordE0 = getFloat(objcoor + Offsets::COORD_ALT_X);
-                float coordE4 = getFloat(objcoor + Offsets::COORD_ALT_Z);
-                float coordE8 = getFloat(objcoor + Offsets::COORD_ALT_Y);
-                
-                if (is_boss && contains(过滤类名, "redqueen") && !is_mirror &&
-                    coordE0 != 0 && coordE8 != 0) {
-                    if (红夫人模式 == 1 && 
-                        ((coordE4 <= -300 && jxpd == Offsets::GHOST_VALUE) || (coordE4 >= -300 && jxpd != Offsets::GHOST_VALUE))) {
-                        红夫人镜像 = 对象;
-                    } else if (coordE4 >= -300 && jxpd != Offsets::GHOST_VALUE) {
-                        红夫人 = 对象;
-                        红夫人模式 = 1;
-                    }
-                }
-                if (is_boss && is_mirror && coordE0 != 0 && coordE8 != 0) {
-                    镜子 = 对象;
-                }
-            }
+        if (obj.阵营 == 3 && show_draw_secret_mechine) {
+            std::string txt = std::string(obj.str) + " " + std::to_string((int)dist) + "m";
+            DrawCenteredText(Draw, { r_x, r_y }, COL_WHITE, txt.c_str());
         }
-        sprintf(监管者预知, "%s", s.c_str());
-        sprintf(fullnameof, "%s", fullname.c_str());
-        
-        // 三缓冲：更新数量，记录写入索引，然后发布给读取线程
-        write_buffer.数量 = 指针数量;
-        g_write_index.store(free_idx, std::memory_order_relaxed);      // 记录本次写入位置
-        g_read_index.store(free_idx, std::memory_order_release);       // 发布给读取线程
-        
-        usleep(8000);  // 8ms 更新一次
+        else if (obj.阵营 == 4 && show_draw_Prop) {
+            std::string txt = std::string(obj.str) + " " + std::to_string((int)dist) + "m";
+            DrawCenteredText(Draw, { r_x, r_y }, COL_YELLOW, txt.c_str());
+        }
+        else if (obj.阵营 == 1 || obj.阵营 == 2) {
+            ImColor boxColor = (obj.阵营 == 1) ? COL_RED : COL_GREEN;
+            Draw->AddRect({ r_x - w / 2, r_w }, { r_x + w / 2, r_y }, boxColor, 0, 0, 1.8f);
+            DrawCenteredText(Draw, { r_x, r_w - 35 }, COL_ORANGE, obj.str);
+            std::string dStr = std::to_string((int)dist) + "m";
+            DrawCenteredText(Draw, { r_x, r_y + 5 }, COL_ORANGE, dStr.c_str());
+            if (show_draw_line) Draw->AddLine({ px, 160 }, { r_x, r_w }, boxColor, 1.5f);
+        }
     }
 }
 
-void Draw_Main(ImDrawList *Draw){
-    // 三缓冲：直接读取活跃缓冲区，无需加锁
-    int read_index = g_read_index.load(std::memory_order_acquire);
-    const GameDataBuffer& read_buffer = g_buffer[read_index];
-    
-    Matrix = getPtr64(getPtr64(libbase + MatrixOffset) + Offsets::MATRIX_PTR_1) + Offsets::MATRIX_OFFSET_1; //矩阵
-    M.X = getFloat(Matrix - Offsets::MATRIX_CAMERA);
-    M.Z = getFloat(Matrix - Offsets::MATRIX_CAMERA + 4);
-    M.Y = getFloat(Matrix - Offsets::MATRIX_CAMERA + 8);
-    
-    // 红夫人坐标读取（加保护检查）
-    if (红夫人 != 0) {
-        uintptr_t 红夫人坐标指针 = getPtr64(红夫人 + Offsets::OBJ_COORD_PTR);
-        if (红夫人坐标指针 != 0) {
-            红夫人X = getFloat(红夫人坐标指针 + Offsets::COORD_X);
-            红夫人Z = getFloat(红夫人坐标指针 + Offsets::COORD_Z);
-            红夫人Y = getFloat(红夫人坐标指针 + Offsets::COORD_Y);
-        }
-    }
-    if (红夫人镜像 != 0) {
-        uintptr_t 镜像坐标指针 = getPtr64(红夫人镜像 + Offsets::OBJ_COORD_PTR);
-        if (镜像坐标指针 != 0) {
-            红夫人镜像X = getFloat(镜像坐标指针 + Offsets::COORD_X);
-            红夫人镜像Z = getFloat(镜像坐标指针 + Offsets::COORD_Z);
-            红夫人镜像Y = getFloat(镜像坐标指针 + Offsets::COORD_Y);
-        }
-    }
-    if (红夫人Z >= -300 && 红夫人镜像Z >= -300&&红夫人X != 0 && 红夫人Y != 0 && 红夫人镜像X != 0 && 红夫人镜像Y != 0) {
-        mirror=true;
-    }else{
-        mirror=false;
-    }
-    Matrix = getPtr64(getPtr64(getPtr64(libbase + MatrixOffset) + Offsets::MATRIX_PTR_1) + Offsets::MATRIX_PTR_2) + Offsets::MATRIX_OFFSET_2; //矩阵
-    memset(matrix, 0, 16);
-    vm_readv(Matrix-4, 过滤矩阵, 17 * 4);
-
-    
-    if (过滤矩阵[0]==1){
-        for (int i = 0; i < 16; i++){
-            if (i<=3){
-                if (过滤矩阵[i+1]>=-2&&过滤矩阵[i+1]<=2)
-                matrix[i]=过滤矩阵[i+1];
-            }else{
-                matrix[i]=过滤矩阵[i+1];
-            }
-        }
-    }
-    if (show_draw_prophet){
-        auto textSize = ImGui::CalcTextSize(监管者预知, 0, 25);
-        Draw->AddText({px-(textSize.x/2),130}, 红色, 监管者预知);
-    }
-
-    for (int i = 0; i < read_buffer.数量; i++){
-        const DataStruct& obj = read_buffer.data[i];  // 引用当前对象
-    
-        // if (strstr(obj.类名, "buzz") != NULL)
-        //     continue;//跳过不知所谓的东西
-        // if (strstr(obj.类名, "nvyao.gim") != NULL)
-        //     continue;//跳过女妖蜡烛
-
-        D.X = getFloat(obj.objcoor + Offsets::COORD_X);
-        D.Z = getFloat(obj.objcoor + Offsets::COORD_Z);
-        D.Y = getFloat(obj.objcoor + Offsets::COORD_Y);
-        
-        if (D.Y<1e-4&&D.Y>-1e-4 || D.X<1e-4&&D.X>-1e-4){
-		    continue;//跳过xy0
-		}
-        // if (D.Z <3 && D.Y<3 &&D.X<3 && D.X >-3 && D.Y>-3 &&D.Z>-3 &&strstr(data[i].str,"哭泣小丑")!=NULL){
-		//     continue;
-		// }//这是不应该出现的东西
-
-
-		if (D.Z<=-300){
-		    continue;//跳过地下
-	}
-		int jxpd = getDword(obj.obj + Offsets::OBJ_GHOST);
-		camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
-        距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / 距离比例;
-        // 矩阵视野距离 = sqrt(pow(D.X - M.X, 2) + pow(D.Y - M.Y, 2) + pow(D.Z - M.Z, 2)) / 距离比例;
-		
-
-		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
-        r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
-        r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
-												
-		W = (r_y - r_w) / 2;	// 宽度
-		H = r_y - r_w;		// 高度
-		X1 = r_x - (r_y - r_w) / 4;	// X1
-		Y1 = r_y - H / 2;	// Y1
-		X2 = X1 + W;		// X2
-		Y2 = Y1 + H;		// Y2
-		if (距离>=300){
-            continue;
-        }
-        //w的判断是否需要继续修改？
-
-        
-        if (W>0){
-            if (Debugging)
-            {                
-                std::string test;
-                sprintf(objtext, "%lx", obj.obj);
-                test += " [";
-                test += std::to_string((int) 距离);    
-                test += " 米]  0x";
-                test += objtext;    
-                test += " [类名] ";
-                test += obj.类名;
-                test += "x|";
-                std::stringstream ss;
-                ss << std::fixed << std::setprecision(2) << D.X;
-                test += ss.str();
-                test += "|y|";
-                ss.str(""); // 清空字符串流
-                ss << std::fixed << std::setprecision(2) << D.Y;
-                test += ss.str();
-                
-               auto textSize = ImGui::CalcTextSize(test.c_str(), 0, 25);
-                Draw->AddText({r_x-(textSize.x/2),r_y}, ImColor(255,200,0,255), test.c_str());
-            }
-		
-            if (obj.阵营 == 3) 
-            {
-            std::string s;
-            if (strstr(obj.类名, "ordnance_factory1\\dm65_scene_sender") != NULL && strstr(obj.类名, "low") != NULL) 
-            {
-                if (show_draw_secret_mechine) {
-                std::ostringstream oss;
-                oss << std::fixed << std::setprecision(1) << 距离;
-                s += "[密码机] " + oss.str() + " 米";
-                auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                Draw->AddText({r_x - (textSize.x / 2), r_y}, 
-                  (距离 >= 61 && 距离 <= 63) ? 绿色 : ImColor(255, 255, 255, 255), 
-                  s.c_str());}
-            } 
-            else if (strstr(obj.类名, "dm65_scene_prop_76") != NULL) 
-            {
-                s += "[地窖] " + std::to_string((int) 距离) + " 米";
-                auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                Draw->AddText({r_x - (textSize.x / 2), r_y}, 浅蓝色, s.c_str());
-            }
-            }
-		
-		    if (show_draw_Prop && obj.阵营 == 4) 
-            {
-            std::string s;
-                s += std::string(obj.str) + " " + std::to_string((int) 距离) + " 米";
-                auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                Draw->AddText({r_x - (textSize.x / 2), r_y}, ImColor(255, 200, 0, 255), s.c_str());     
-            }
-
-            int zy;//=getbool(obj.obj + Offsets::OBJ_SELF);
-            vm_readv(obj.obj + Offsets::OBJ_SELF, &zy, 1);        
-                
-            if (getFloat(obj.obj + Offsets::OBJ_CAMP) == Offsets::CAMP_VALUE || strstr(obj.str,"哭泣小丑") != NULL)
-            {     
-                // if (strstr(obj.类名, "h55_joseph_camera") != NULL){
-                //     continue;//跳过约瑟夫相机
-                // }
-                    
-                if (strstr(obj.类名, "redqueen_mirror") != NULL){
-                    continue;//跳过红芙蓉镜子
-                }
-                
-                // if (strstr(obj.类名, "burke_console") != NULL){
-    		    //     continue;//跳过疯眼场景
-    		    // }
-    		    
-    			// if (strstr(obj.类名, "h55_survivor_w_shangren_tiaoban") != NULL){
-    			//     continue;//跳过商人跳板
-    			// }
-    			
-                //我需要优化自身判定			            
-                if (camera < 40 && camera > 10 && zy&&(obj.阵营==1||obj.阵营==2))
-                {
-                    自身 = obj.obj;
-                    Z.X = D.X;
-                    Z.Z = D.Z;
-                    Z.Y = D.Y;
-                    自身阵营=对象阵营;
-                       continue;
-                }
-
-                //处理主要绘制逻辑
-                //自定义显示鬼魂
-
-                std::string s;
-                s += obj.str;//翻译名
-                auto textSize = ImGui::CalcTextSize(s.c_str(), 0, 25);
-                std::string 人物距离;
-                人物距离 += std::to_string((int) 距离);
-                人物距离 += " 米";
-                auto textSize1 = ImGui::CalcTextSize(人物距离.c_str(), 0, 25);
-                if (obj.阵营 == 1 || obj.阵营 == 2) {
-                    if(jxpd == Offsets::GHOST_VALUE && !inform_ghost){continue;}         
-                    else
-                {
-                    if(jxpd == Offsets::GHOST_VALUE)
-                    {
-                        if (strstr(obj.str, "红蝶") != NULL || strstr(obj.str, "无常") != NULL || strstr(obj.str, "歌剧") != NULL|| strstr(obj.str, "破轮") != NULL || strstr(obj.str, "木偶") != NULL) {
-                            continue;
-                        }
-                        else
-                        {
-                            ImGui::GetForegroundDrawList()->AddRect({X1, Y1}, {X2, Y2}, 浅蓝色, 3, 0, 1.8);
-                            Draw->AddText({X1 + W / 2 - (textSize.x / 2), Y1 - 45}, ImColor(255, 200, 0, 255), s.c_str());
-                        }
-                    }
-                    
-                else
-                {
-                    if (obj.阵营 == 1) 
-                    {
-                        ImGui::GetForegroundDrawList()->AddRect({X1, Y1}, {X2, Y2}, BoneColor, 3, 0, 1.8f);
-                        Draw->AddText({X1 + W / 2 - (textSize.x / 2), Y1 - 45}, ImColor(255, 200, 0, 255), s.c_str());
-                        Draw->AddText({X1 + W / 2 - (textSize1.x / 2), Y2 + 10}, ImColor(255, 200, 0, 255), 人物距离.c_str());
-                    }
-                    else if (obj.阵营 == 2)
-                    {
-                        ImGui::GetForegroundDrawList()->AddRect({X1, Y1}, {X2, Y2}, 绿色, 3, 0, 1.8f);
-                        Draw->AddText({X1 + W / 2 - (textSize.x / 2), Y1 - 45}, ImColor(255, 200, 0, 255), s.c_str());
-                        Draw->AddText({X1 + W / 2 - (textSize1.x / 2), Y2 + 10}, ImColor(255, 200, 0, 255), 人物距离.c_str());
-                    }
-
-                    if (obj.阵营 == 1) {
-                        ImGui::GetForegroundDrawList()->AddLine({px, 160}, {X1 + W / 2, Y1}, ImColor(255, 20, 147), 2);
-                    } else if (obj.阵营 == 2 ) {
-                        ImGui::GetForegroundDrawList()->AddLine({px, 160}, {X1 + W / 2, Y1}, ImColor(255, 255, 255), 2);
-                    }
-                }
-                }
-                }
-                        
-            }                                                          			
-    	}  
-    
-	                
-	   //红夫人镜像                                   
-	    if (mirror&&redqueenmod){
-            if (getFloat(obj.obj + Offsets::OBJ_CAMP) == Offsets::CAMP_VALUE && obj.阵营 == 2){
-                std::string ss;
-                calculate_mirror_reflection(红夫人X, 红夫人Y, 红夫人镜像X, 红夫人镜像Y, D.X, D.Y, &xs_prime_mirror, &ys_prime_mirror);
-                calculate_line_reflection(红夫人X, 红夫人Y, 红夫人镜像X,  红夫人镜像Y,xs_prime_mirror, ys_prime_mirror, &D.X, &D.Y);
-                camera = matrix[3] * D.X + matrix[7] * D.Z + matrix[11] * D.Y + matrix[15];
-                距离 = sqrt(pow(D.X - Z.X, 2) + pow(D.Y - Z.Y, 2) + pow(D.Z - Z.Z, 2)) / 距离比例;
-        		r_x = px + (matrix[0] * D.X + matrix[4] * D.Z + matrix[8] * D.Y + matrix[12]) / camera * px;
-                r_y = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 8.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
-                r_w = py - (matrix[1] * D.X + matrix[5] * (D.Z+ 28.5) + matrix[9] * (D.Y) + matrix[13]) / camera * py;
-												
-        		W = (r_y - r_w) / 2;	// 宽度
-        		H = r_y - r_w;		// 高度
-        		X1 = r_x - (r_y - r_w) / 4;	// X1
-        		Y1 = r_y - H / 2;	// Y1
-        		X2 = X1 + W;		// X2
-        		Y2 = Y1 + H;		// Y2
-        
-                if (W>0){
-
-                    ss += obj.str;
-                    auto textSize = ImGui::CalcTextSize(ss.c_str(), 0, 25);
-                    Draw->AddText({X1 + W/2-(textSize.x/2),Y1-45}, BotBoneColor, ss.c_str());
-                        ImGui::GetForegroundDrawList()->AddRect({X1, Y1},{X2, Y2}, BotBoneColor,3, 0,1.8f);   
-                        std::string 镜像距离;
-                        镜像距离 += std::to_string((int) 距离);
-                        镜像距离 += " 米";
-                        auto textSize1 = ImGui::CalcTextSize(镜像距离.c_str(), 0, 25);
-                        Draw->AddText({X1 + W/2-(textSize1.x/2),Y2+10}, BotBoneColor, 镜像距离.c_str());
-                        ImGui::GetForegroundDrawList()->AddLine({px, 160},{X1 + W/2, Y1}, ImColor(255, 255, 255),2);
-                               
-                }//判断W
-            }                
-        }
-    }      
-}
-        
-static bool show_window = true; // 控制内部窗口显示的布尔变量
-static bool voice = true; // 初始化 voice 变量
-
-// 获取输入设备数量
-int GetInputDeviceCount() {
-    DIR *dir = opendir("/dev/input/");
-    if (!dir) return -1;
-    dirent *ptr = NULL;
-    int count = 0;
-    while ((ptr = readdir(dir)) != NULL) {
-        if (strstr(ptr->d_name, "event"))
-            count++;
-    }
-    closedir(dir);  // 关闭目录
-    return count ? count : -1;
-}
-
-// 在 VolumeKeyHide 中更新 show_window
-void VolumeKeyHide() {
-    int EventCount = GetInputDeviceCount(); // 获取输入设备数量
-    if (EventCount <= 0) return;
-    
-    int *fdArray = (int *)malloc(EventCount * sizeof(int));
-    if (!fdArray) return;
-
-    for (int i = 0; i < EventCount; i++) {
-        char temp[128];
-        sprintf(temp, "/dev/input/event%d", i);
-        fdArray[i] = open(temp, O_RDWR | O_NONBLOCK);
-    }
-
-    input_event ev;
-
-    while (1) {
-        for (int i = 0; i < EventCount; i++) {
-            if (fdArray[i] < 0) continue;  // 跳过无效的文件描述符
-            
-            memset(&ev, 0, sizeof(ev));
-            // 非阻塞读取，不需要每个设备都 usleep
-            while (read(fdArray[i], &ev, sizeof(ev)) == sizeof(ev)) {
-                if (ev.type == EV_KEY && ev.code == KEY_VOLUMEDOWN && ev.value == 1) {
-                    voice = false;
-                }
-                if (ev.type == EV_KEY && ev.code == KEY_VOLUMEUP && ev.value == 1) {
-                    voice = true;
-                }
-            }
-        }
-
-        // 更新窗口状态
-        show_window = voice;
-        
-        usleep(10000);  // 10ms 检查一次，替代原来的 1ms*N + 0.5ms
-    }
-
-    free(fdArray);
-}
-
-void Layout_tick_UI(bool *main_thread_flag) {
-    static bool volume_thread_started = false; // 用来确保只启动一次线程
-
-    if (!volume_thread_started) {
-        std::thread volume_thread(VolumeKeyHide);
-        volume_thread.detach(); // 将线程分离，确保程序继续运行
-        volume_thread_started = true;
-    }
-
-    // 屏幕中心坐标
-    px = static_cast<float>(displayInfo.width) / 2;
-    py = static_cast<float>(displayInfo.height) / 2;
-
-    // 自定义绘制（保持原有逻辑）
-    Draw_Main(ImGui::GetForegroundDrawList()); 
-
-    // 如果按钮被点击，显示详细信息窗口
+void Layout_tick_UI(bool* main_thread_flag) {
+    static bool init_once = false; if (!init_once) { std::thread(VolumeKeyHide).detach(); init_once = true; }
+    px = displayInfo.width / 2.0f; py = displayInfo.height / 2.0f;
+    if (enable_arms_factory) Draw_UnifiedMap(ImGui::GetForegroundDrawList(), Maps[g_manual_map_index]);
+    Draw_Main(ImGui::GetForegroundDrawList());
     if (show_window) {
-        ImGui::Begin("New_Edition", nullptr, ImGuiWindowFlags_AlwaysAutoResize); // 自动调整大小的窗口
-
-        // 创建窗口并应用透明度
-        
-        // 恢复窗口位置与大小（如果需要）
-        if (::permeate_record_ini) {
-            ImGui::SetWindowPos({LastCoordinate.Pos_x, LastCoordinate.Pos_y});
-            ImGui::SetWindowSize({LastCoordinate.Size_x, LastCoordinate.Size_y});
-            permeate_record_ini = false;
+        ImGui::Begin("Acid_D5", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        if (ImGui::CollapsingHeader("数据诊断")) {
+            ImGui::Text("状态: %s", 状态 == 2 ? "✅ 已连接" : "扫描中...");
+            int idx = g_read_index.load(); ImGui::Text("对象数: %d", g_buffer[idx].数量);
+            ImGui::Text("SelfPos: (%.1f, %.1f)", Z.X, Z.Y); ImGui::Text("锁定对象: %s", 自身名字);
         }
-
-        // 渲染模式与 FPS 信息
-        ImGui::Text("渲染模式 : %s, gui版本 : %s", graphics->RenderName, IMGUI_VERSION);
-        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "帧率 %.1f FPS", ImGui::GetIO().Framerate);
-        
-        // 内存占用
-        size_t mem_kb = get_memory_usage_kb();
-        if (mem_kb >= 1024) {
-            ImGui::Text("内存占用: %.2f MB", mem_kb / 1024.0f);
-        } else {
-            ImGui::Text("内存占用: %zu KB", mem_kb);
+        if (ImGui::CollapsingHeader("小地图设置")) {
+            ImGui::Checkbox("启用小地图", &enable_arms_factory);
+            const char* map_names[] = { "军工厂", "红教堂", "圣心医院", "湖景村", "月亮河", "里奥回忆", "永眠镇", "唐人街", "不归林" };
+            ImGui::Combo("选择地图", &g_manual_map_index, map_names, IM_ARRAYSIZE(map_names));
+            ImGui::SliderFloat("地图缩放", &map_display_size, 100.0f, 800.0f);
+            ImGui::SliderFloat("位置 X", &map_pos_x, 0, displayInfo.width);
+            ImGui::SliderFloat("位置 Y", &map_pos_y, 0, displayInfo.height);
         }
-
-        // 数据状态
-        ImGui::Text("数据状态:");
-        if (状态 == 2) {
-            ImGui::TextColored(ImVec4(0.0f, 205.0f, 0.0f, 100.0f), "已获取到游戏数据");
-        } else if (状态 == 1) {
-            ImGui::TextColored(ImVec4(255.0f, 0.0f, 0.0f, 100.0f), "正在获取游戏数据");
+        if (ImGui::CollapsingHeader("显示设置")) {
+            ImGui::Checkbox("显示射线", &show_draw_line);
+            ImGui::Checkbox("显示名字/距离", &show_draw_prophet);
+            ImGui::Checkbox("显示密码机/地窖", &show_draw_secret_mechine);
+            ImGui::Checkbox("显示道具", &show_draw_Prop);
+            ImGui::Checkbox("过滤幽灵/隐身", &inform_ghost);
+            ImGui::Checkbox("调试模式", &Debugging);
         }
-
-        // 折叠区域：基础信息
-        if (ImGui::CollapsingHeader("基础信息")) {
-            ImGui::Text("游戏进程:%d", pid);
-            ImGui::Text("模块入口:%lx", libbase);
-            ImGui::Text("游戏包名:%s", extractedString);
-            //数据没有清除功能
-            ImGui::Text("矩阵地址:%lx", Matrix);
-            ImGui::Text("数组地址:%lx", Arrayaddr);
-            ImGui::Text("矩阵偏移:%lx", MatrixOffset);
-            ImGui::Text("模块页数:%d", c);
-            ImGui::Text("数组偏移:%lx", ArrayaddrOffset);
-            ImGui::Text("数据获取状态:%d", 数据获取状态);
-            // ImGui::Text("自身x:%f", Z.X);
-            // ImGui::Text("自身y:%f", Z.Y);
-            // ImGui::Text("自身z:%f", Z.Z);
-            ImGui::Text("监管者:%s", 监管者预知);
-            // ImGui::Text("红夫人:%lx", 红夫人);
-            // ImGui::Text("红夫人镜像:%lx", 红夫人镜像);
-            // ImGui::Text("镜子:%lx", 镜子);
-            // ImGui::Text("镜子状态:%d", mirror);
-            // ImGui::Text("监管者类名:%s",fullnameof);
-        }
-        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-        // 折叠区域：绘制设置
-        if (ImGui::CollapsingHeader("绘制设置")) {
-
-            ImGui::Text("自动砸板");
-            ImGui::Checkbox("显示鬼魂", &inform_ghost);
-            ImGui::SameLine();
-            ImGui::Checkbox("预知监管", &show_draw_prophet);
-
- 
-            ImGui::Checkbox("绘制道具", &show_draw_Prop);
-            ImGui::SameLine();
-            ImGui::Checkbox("夫人模式", &redqueenmod);
-
-            ImGui::Checkbox("绘制调试", &Debugging);
-            ImGui::SameLine();
-            ImGui::Checkbox("显示密码机", &show_draw_secret_mechine);
-            ImGui::Text("");
-            if (ImGui::Button("结束进程"))
-            {
-                exit(0);
-            }
-        }
-
-        ImGui::End(); // 详细信息面板结束
+        if (ImGui::Button("退出程序")) exit(0);
+        ImGui::End();
     }
 }

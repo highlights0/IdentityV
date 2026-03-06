@@ -58,7 +58,7 @@ int main(int argc, char *argv[]) {
     value2 = 16384;
     value3 = 257;
 
-    ::graphics = GraphicsManager::getGraphicsInterface(GraphicsManager::VULKAN);//绘图方式
+    ::graphics = GraphicsManager::getGraphicsInterface(GraphicsManager::OPENGL);//绘图方式
 
     // 获取屏幕信息    
     ::screen_config(); 
@@ -69,8 +69,8 @@ int main(int argc, char *argv[]) {
     ::abs_ScreenY = (::displayInfo.height < ::displayInfo.width ? ::displayInfo.height : ::displayInfo.width);
 
     // GetPKG();
-    
-    ::window = android::ANativeWindowCreator::Create("逆天改命", native_window_screen_x, native_window_screen_y, permeate_record);
+
+    ::window = android::ANativeWindowCreator::Create("AcidD5", native_window_screen_x, native_window_screen_y, permeate_record);
     graphics->Init_Render(::window, native_window_screen_x, native_window_screen_y);
     
     Touch::Init({(float)::abs_ScreenX, (float)::abs_ScreenY}, true);
@@ -80,8 +80,7 @@ int main(int argc, char *argv[]) {
     
     DrawFPS.SetFps(fps);
     DrawFPS.AotuFPS_init();
-    DrawFPS.setAffinityLittleCore();  // 优化：只使用小核，避免大核占用
-    DrawFPS.setLowPriority(5);        // 降低优先级，减少资源抢占
+    DrawFPS.setAffinity();
     
     ::init_My_drawdata();  // 初始化绘制数据
     
@@ -99,11 +98,3 @@ int main(int argc, char *argv[]) {
     android::ANativeWindowCreator::Destroy(::window);
     return 0;
 }
-
-
-//加入错误日志防止闪退
-/*我修改了VkPresentModeKHR present_modes[] = {
-    VK_PRESENT_MODE_MAILBOX_KHR,   // 首选：低延迟，无撕裂
-    VK_PRESENT_MODE_FIFO_KHR,      // 备选：最稳定，兼容性最好
-    VK_PRESENT_MODE_IMMEDIATE_KHR  // 备选：最低延迟，但可能出现撕裂
-};*/
