@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <cstring>
 #include <sstream>
 #include <iomanip>
 #include <atomic>
@@ -16,7 +17,6 @@
 
 // ================== 图片加载支持 ==================
 #include <GLES2/gl2.h>
-#define STB_IMAGE_IMPLEMENTATION 
 #include "stb_image.h"
 // ================================================
 
@@ -43,11 +43,17 @@ struct DataStruct {
     int 阵营 = 0; // 1:监管, 2:求生, 3:场景, 4:道具
     char 类名[256] = { 0 };
     long int objcoor = 0;
+    Vector3A pos = { 0.0f, 0.0f, 0.0f };
+    bool has_pos = false;
+    bool is_ghost_obj = false;
+    uint8_t flag_aa = 0;
 };
 
 struct GameDataBuffer {
     DataStruct data[2000];
     int 数量 = 0;
+    float matrix[16] = { 0.0f };
+    bool matrix_valid = false;
 };
 
 struct MapConfig {
@@ -167,6 +173,41 @@ char 监管者预知[1024] = { 0 };
 char extractedString[64] = { 0 };
 int 状态 = 0;
 int 遍历次数 = 0;
+static constexpr long kReadLoopSleepUs = 50000;  // 50ms，降低驱动压力
+static constexpr int kMaxEntityScanCount = 600;  // 限制单轮最大对象数
+
+static inline bool IsLikelyPtr(uintptr_t p) {
+    return p >= 0x10000ULL && p <= 0x00FFFFFFFFFFFFFFULL;
+}
+
+static inline bool ReadPtr64Safe(uintptr_t addr, uintptr_t& out) {
+    if (!IsLikelyPtr(addr)) return false;
+    unsigned long raw = 0;
+    if (!vm_readv(addr, &raw, sizeof(raw))) return false;
+    uintptr_t value = static_cast<uintptr_t>(raw) & 0x00FFFFFFFFFFFFFFULL;
+    if (value == 0) {
+        out = 0;
+        return true;
+    }
+    if (!IsLikelyPtr(value)) return false;
+    out = value;
+    return true;
+}
+
+static inline bool ReadI32Safe(uintptr_t addr, int& out) {
+    if (!IsLikelyPtr(addr)) return false;
+    return vm_readv(addr, &out, sizeof(out));
+}
+
+static inline bool ReadF32Safe(uintptr_t addr, float& out) {
+    if (!IsLikelyPtr(addr)) return false;
+    return vm_readv(addr, &out, sizeof(out));
+}
+
+static inline bool ReadU8Safe(uintptr_t addr, uint8_t& out) {
+    if (!IsLikelyPtr(addr)) return false;
+    return vm_readv(addr, &out, sizeof(out));
+}
 
 size_t get_memory_usage_kb() {
     FILE* file = fopen("/proc/self/statm", "r");
@@ -258,9 +299,8 @@ int get_name_pid1(const char* packageName) {
 }
 
 bool GetEntityPosition(const DataStruct& obj, Vector3A& pos) {
-    pos.X = getFloat(obj.objcoor + 0xA0);
-    pos.Y = getFloat(obj.objcoor + 0xA8);
-    pos.Z = getFloat(obj.objcoor + 0xA4);
+    if (!obj.has_pos) return false;
+    pos = obj.pos;
     if (fabs(pos.X) < 1e-4 && fabs(pos.Y) < 1e-4 && fabs(pos.Z) < 1e-4) return false;
     return true;
 }
@@ -268,21 +308,9 @@ bool GetEntityPosition(const DataStruct& obj, Vector3A& pos) {
 bool ShouldSkipEntity(const DataStruct& obj, const Vector3A& pos) {
     if (pos.Z <= -300.0f) return true;
     if (should_filter(obj.类名)) return true;
-    int checkVal = getDword(obj.obj + Offsets::OBJ_CHECK_OFFSET);       // 0x70
-    float checkFloat = getFloat(obj.obj + Offsets::OBJ_CHECK_OFFSET_2); // 0x1A0
 
-    // 2. 定义什么是幽灵：如果不等于有效值(0x1000000) 或 浮点数不对(450.0)，则视为幽灵/无效
-    // 引用源码：if ( (_DWORD)v130 != 0x1000000 ) goto LABEL_67; [cite: 144]
-    // 引用源码：if ( *(float *)&v130 != 450.0 ) goto LABEL_67; [cite: 148]
-    bool is_ghost_obj = (checkVal != Offsets::VALID_ACTOR_VALUE || checkFloat != Offsets::VALID_ACTOR_FLOAT);
-
-    // 3. 替换原本的 if (jxpd == Offsets::GHOST_VALUE)
-    if (is_ghost_obj) {
-        // 逻辑 A: 如果没开启“显示幽灵”功能，直接返回 true (过滤掉)
+    if (obj.is_ghost_obj) {
         if (!inform_ghost) return true;
-
-        // 逻辑 B: 即使开启了显示幽灵，如果是以下特定的监管者，依然返回 true (过滤掉)
-        // (保留了你原版的特殊过滤列表)
         if (strstr(obj.str, "红蝶") || strstr(obj.str, "无常") ||
             strstr(obj.str, "歌剧") || strstr(obj.str, "破轮") || strstr(obj.str, "木偶") || strstr(obj.str, "冒险家")) {
             return true;
@@ -354,10 +382,16 @@ void read_thread(long int PD1, long int PD2, long int PD3) {
     }
     int c = (result.taddr - result.addr) / 4096;
     unsigned long buff[512];
+    if (result.addr == 0 || result.taddr <= result.addr || c <= 0) {
+        状态 = 0;
+        return;
+    }
     while (MatrixOffset == 0 || ArrayaddrOffset == 0) {
         状态 = 1;
         for (int i = 0; i < c; i++) {
-            vm_readv(result.addr + (i * 4096), &buff, 0x1000);
+            if (!vm_readv(result.addr + (i * 4096), &buff, 0x1000)) {
+                continue;
+            }
             for (int ii = 0; ii < 512; ii++) {
                 unsigned long val = buff[ii];
                 long int CurrentAddr = result.addr + (i * 4096) + (ii * 8);
@@ -376,51 +410,104 @@ void read_thread(long int PD1, long int PD2, long int PD3) {
     char temp_name[128]; std::string s_prophet;
     while (true) {
         uintptr_t ArrayStruct = libbase + ArrayaddrOffset;
-        uintptr_t StartPtr = getPtr64(ArrayStruct);
-        uintptr_t EndPtr = getPtr64(ArrayStruct + 8);
+        uintptr_t StartPtr = 0;
+        uintptr_t EndPtr = 0;
+        if (!ReadPtr64Safe(ArrayStruct, StartPtr) || !ReadPtr64Safe(ArrayStruct + 8, EndPtr)) {
+            usleep(kReadLoopSleepUs);
+            continue;
+        }
         long count = 0;
         if (StartPtr > 0 && EndPtr > StartPtr) count = (EndPtr - StartPtr) / 8;
         if (count > 2000) count = 2000;
+        if (count > kMaxEntityScanCount) count = kMaxEntityScanCount;
         int read_idx = g_read_index.load(std::memory_order_acquire);
         int last_write = g_write_index.load(std::memory_order_relaxed);
         int free_idx = 0;
         for (int i = 0; i < 3; i++) if (i != read_idx && i != last_write) { free_idx = i; break; }
         GameDataBuffer& buffer = g_buffer[free_idx];
         int count_valid = 0; s_prophet.clear();
+
+        buffer.matrix_valid = false;
+        uintptr_t Ptr1 = 0;
+        uintptr_t Ptr2 = 0;
+        uintptr_t MatrixRealAddr = 0;
+        if (ReadPtr64Safe(libbase + MatrixOffset, Ptr1) && Ptr1 != 0 &&
+            ReadPtr64Safe(Ptr1 + Offsets::MATRIX_PTR_2, Ptr2) && Ptr2 != 0) {
+            MatrixRealAddr = Ptr2 + Offsets::MATRIX_OFFSET_2;
+            if (IsLikelyPtr(MatrixRealAddr) && vm_readv(MatrixRealAddr, buffer.matrix, sizeof(buffer.matrix))) {
+                buffer.matrix_valid = true;
+            }
+        }
+
         for (int ii = 0; ii < count; ii++) {
             if (count_valid >= 1999) break;
-            uintptr_t objPtr = getPtr64(StartPtr + ii * 8);
+            uintptr_t objPtr = 0;
+            if (!ReadPtr64Safe(StartPtr + ii * 8, objPtr)) continue;
             if (objPtr == 0) continue;
-            uintptr_t component_ptr = getPtr64(objPtr + 0x28);
+            uintptr_t component_ptr = 0;
+            if (!ReadPtr64Safe(objPtr + Offsets::OBJ_COORD_PTR, component_ptr)) continue;
             if (component_ptr == 0) continue;
-            uintptr_t name_struct = getPtr64(getPtr64(getPtr64(getPtr64(getPtr64(objPtr + 0xF8) + 0x0) + 0x8) + 0x20) + 0x20);
+
+            uintptr_t name_ptr_1 = 0, name_ptr_2 = 0, name_ptr_3 = 0, name_ptr_4 = 0, name_struct = 0;
+            if (!ReadPtr64Safe(objPtr + Offsets::CLASSNAME_BASE, name_ptr_1) || name_ptr_1 == 0) continue;
+            if (!ReadPtr64Safe(name_ptr_1 + Offsets::CLASSNAME_STEP1, name_ptr_2) || name_ptr_2 == 0) continue;
+            if (!ReadPtr64Safe(name_ptr_2 + Offsets::CLASSNAME_STEP2, name_ptr_3) || name_ptr_3 == 0) continue;
+            if (!ReadPtr64Safe(name_ptr_3 + Offsets::CLASSNAME_STEP3, name_ptr_4) || name_ptr_4 == 0) continue;
+            if (!ReadPtr64Safe(name_ptr_4 + Offsets::CLASSNAME_STEP4, name_struct)) continue;
             if (name_struct == 0) continue;
-            int name_len = getDword(name_struct + 0x10);
-            uintptr_t name_val_ptr = getPtr64(name_struct + 0x8);
-            if (name_val_ptr != 0 && name_len > 0 && name_len < 128) {
-                vm_readv(name_val_ptr, temp_name, name_len); temp_name[name_len] = '\0';
+
+            int name_len = 0;
+            if (!ReadI32Safe(name_struct + Offsets::CLASSNAME_LEN, name_len)) continue;
+            uintptr_t name_val_ptr = 0;
+            if (!ReadPtr64Safe(name_struct + Offsets::CLASSNAME_FINAL, name_val_ptr)) continue;
+            if (name_val_ptr != 0 && name_len > 0 && name_len < static_cast<int>(sizeof(temp_name))) {
+                if (!vm_readv(name_val_ptr, temp_name, name_len)) continue;
+                temp_name[name_len] = '\0';
             }
             else continue;
             if (should_filter(temp_name)) continue;
             DataStruct& item = buffer.data[count_valid];
             item.obj = objPtr; item.objcoor = component_ptr;
-            strcpy(item.类名, temp_name); item.阵营 = 0; bool added = false;
+            snprintf(item.类名, sizeof(item.类名), "%s", temp_name);
+            item.阵营 = 0;
+            item.has_pos = false;
+            item.is_ghost_obj = true;
+            item.flag_aa = 0;
+            bool added = false;
+
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            bool read_pos_ok =
+                ReadF32Safe(component_ptr + Offsets::COORD_X, x) &&
+                ReadF32Safe(component_ptr + Offsets::COORD_Z, y) &&
+                ReadF32Safe(component_ptr + Offsets::COORD_Y, z);
+            if (read_pos_ok) {
+                item.pos = { x, y, z };
+                item.has_pos = true;
+            }
+
+            int checkVal = 0;
+            float checkFloat = 0.0f;
+            bool check_ok = ReadI32Safe(objPtr + Offsets::OBJ_CHECK_OFFSET, checkVal) &&
+                            ReadF32Safe(objPtr + Offsets::OBJ_CHECK_OFFSET_2, checkFloat);
+            item.is_ghost_obj = !check_ok || (checkVal != Offsets::VALID_ACTOR_VALUE || checkFloat != Offsets::VALID_ACTOR_FLOAT);
+            (void)ReadU8Safe(objPtr + 0xAA, item.flag_aa);
+
             if (strstr(temp_name, "boss")) {
                 if (IsFakeHunter(temp_name)) continue;
-                strcpy(item.str, getboss(temp_name)); item.阵营 = 1; added = true;
+                snprintf(item.str, sizeof(item.str), "%s", getboss(temp_name)); item.阵营 = 1; added = true;
                 if (s_prophet.find(item.str) == std::string::npos && !strstr(item.str, "butcher")) s_prophet += std::string(item.str) + " ";
             }
             else if (strstr(temp_name, "player")) {
-                strcpy(item.str, getplayer(temp_name)); item.阵营 = 2; added = true;
+                snprintf(item.str, sizeof(item.str), "%s", getplayer(temp_name)); item.阵营 = 2; added = true;
             }
             else if (strstr(temp_name, "scene_sender") && strstr(temp_name, "low")) {
-                item.阵营 = 3; strcpy(item.str, "密码机"); added = true;
+                item.阵营 = 3; snprintf(item.str, sizeof(item.str), "密码机"); added = true;
             }
             else if (strstr(temp_name, "prop_76")) {
-                item.阵营 = 3; strcpy(item.str, "地窖"); added = true;
+                item.阵营 = 3; snprintf(item.str, sizeof(item.str), "地窖"); added = true;
             }
             else if (strstr(temp_name, "prop")) {
-                item.阵营 = 4; strcpy(item.str, "道具"); added = true;
+                item.阵营 = 4; snprintf(item.str, sizeof(item.str), "道具"); added = true;
             }
             if (added) count_valid++;
         }
@@ -428,7 +515,7 @@ void read_thread(long int PD1, long int PD2, long int PD3) {
         buffer.数量 = count_valid;
         g_write_index.store(free_idx, std::memory_order_relaxed);
         g_read_index.store(free_idx, std::memory_order_release);
-        usleep(15000);
+        usleep(kReadLoopSleepUs);
     }
 }
 
@@ -533,10 +620,8 @@ void VolumeKeyHide() {
 void Draw_Main(ImDrawList* Draw) {
     int read_idx = g_read_index.load(std::memory_order_acquire);
     const GameDataBuffer& buf = g_buffer[read_idx];
-    uintptr_t Step1_Addr = libbase + MatrixOffset;
-    uintptr_t Ptr1 = getPtr64(Step1_Addr); if (Ptr1 == 0) return;
-    uintptr_t Step2_Addr = Ptr1 + 0xA58; uintptr_t Ptr2 = getPtr64(Step2_Addr); if (Ptr2 == 0) return;
-    uintptr_t MatrixRealAddr = Ptr2 + 0x2C0; vm_readv(MatrixRealAddr, matrix, 16 * 4);
+    if (!buf.matrix_valid) return;
+    memcpy(matrix, buf.matrix, sizeof(matrix));
     if (fabs(matrix[0]) < 0.0001f && fabs(matrix[1]) < 0.0001f) return;
 
     if (show_draw_prophet && 监管者预知[0] != '\0') DrawCenteredText(Draw, { px, 130 }, COL_RED, 监管者预知);
@@ -565,8 +650,7 @@ void Draw_Main(ImDrawList* Draw) {
         if (cam_z < 5.0f || cam_z > 80.0f) continue;
 
         // 5. 读取标志位 (保留原有的校验逻辑，增加安全性)
-        int zy = 0;
-        vm_readv(obj.obj + 0xAA, &zy, 1);
+        int zy = obj.flag_aa;
         if (!(zy & 1)) continue; // 如果校验位不对，跳过
 
         // 6. 计算屏幕坐标 X (核心修改)
@@ -652,6 +736,11 @@ void Draw_Main(ImDrawList* Draw) {
 void Layout_tick_UI(bool* main_thread_flag) {
     static bool init_once = false; if (!init_once) { std::thread(VolumeKeyHide).detach(); init_once = true; }
     px = displayInfo.width / 2.0f; py = displayInfo.height / 2.0f;
+    int read_idx = g_read_index.load(std::memory_order_acquire);
+    const GameDataBuffer& frame_buf = g_buffer[read_idx];
+    if (frame_buf.matrix_valid) {
+        memcpy(matrix, frame_buf.matrix, sizeof(matrix));
+    }
     if (enable_arms_factory) Draw_UnifiedMap(ImGui::GetForegroundDrawList(), Maps[g_manual_map_index]);
     Draw_Main(ImGui::GetForegroundDrawList());
     if (show_window) {

@@ -371,7 +371,10 @@ unsigned long getPtr64(unsigned long addr)
 {
 	addr=addr& 0xffffffffffffff;
 	long var = 0;
-    driver->read(addr, &var, 8);
+    if (!driver->read(addr, &var, 8))
+    {
+        return 0;
+    }
 	return var& 0xffffffffffffff;
 }
 

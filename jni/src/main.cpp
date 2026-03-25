@@ -52,7 +52,7 @@ void daemonize() {
 }
 
 int main(int argc, char *argv[]) {
-    daemonize();  // 将程序转为守护进程
+    // daemonize();  // 将程序转为守护进程
     
     value1 = 970061201;
     value2 = 16384;
@@ -64,7 +64,7 @@ int main(int argc, char *argv[]) {
     ::screen_config(); 
 
     ::native_window_screen_x = (::displayInfo.height > ::displayInfo.width ? ::displayInfo.height : ::displayInfo.width);
-    ::native_window_screen_y = (::displayInfo.height > ::displayInfo.width ? ::displayInfo.height : ::displayInfo.width);
+    ::native_window_screen_y = (::displayInfo.height < ::displayInfo.width ? ::displayInfo.height : ::displayInfo.width);
     ::abs_ScreenX = (::displayInfo.height > ::displayInfo.width ? ::displayInfo.height : ::displayInfo.width);
     ::abs_ScreenY = (::displayInfo.height < ::displayInfo.width ? ::displayInfo.height : ::displayInfo.width);
 
